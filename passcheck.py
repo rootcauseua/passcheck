@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-passcheck — простий аналізатор надійності паролів.
+passcheck — offline password strength analyzer.
+passcheck — офлайн-аналізатор надійності паролів.
 
-Перевіряє пароль на довжину, різноманітність символів, наявність
-у списку найпоширеніших паролів світу та оцінює приблизний час
-на brute-force підбір.
+Checks length, character variety, dictionary/leaked-password matches
+(including common mutations like trailing digits or leetspeak), and
+estimates a rough brute-force crack time.
+
+Перевіряє довжину, різноманітність символів, збіги зі словником
+витоків (враховуючи типові мутації — цифри в кінці, leetspeak),
+та оцінює приблизний час на brute-force підбір.
 
 Author: rootcause
 License: MIT
@@ -15,16 +20,33 @@ from __future__ import annotations
 import argparse
 import getpass
 import math
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 COMMON_PASSWORDS_FILE = Path(__file__).parent / "data" / "common_passwords.txt"
 
 # Приблизна швидкість перебору сучасним GPU-кластером (хешів/сек)
-GUESSES_PER_SECOND = 10_000_000_000  # 10 млрд/с, орієнтир для швидких хешів (MD5/SHA1)
+# Approx. guesses/sec for a modern GPU rig against fast, unsalted hashes (MD5/SHA1)
+GUESSES_PER_SECOND = 10_000_000_000
+
+# Типові leet-заміни, які перевіряються при нормалізації
+LEET_MAP = str.maketrans({
+    "0": "o",
+    "1": "i",
+    "3": "e",
+    "4": "a",
+    "5": "s",
+    "7": "t",
+    "@": "a",
+    "$": "s",
+})
+
+# Символи, які вважаються типовим "хвостом" (цифра в кінці, рік, "!", "123")
+TRAILING_CHARS = re.compile(r"[\d!@#$%^&*_\-.]")
 
 
 @dataclass
@@ -38,6 +60,7 @@ class PasswordReport:
     charset_size: int
     entropy_bits: float
     is_common: bool
+    matched_base: str | None  # який саме "базовий" пароль зі словника збігся
     crack_time_seconds: float
     score: int  # 0-4
     verdict: str
@@ -47,7 +70,47 @@ def load_common_passwords() -> set[str]:
     if not COMMON_PASSWORDS_FILE.exists():
         return set()
     with open(COMMON_PASSWORDS_FILE, encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
+        return {line.strip().lower() for line in f if line.strip()}
+
+
+def _trailing_strip_candidates(s: str, min_prefix: int = 3) -> list[str]:
+    """
+    Перебирає всі префікси, що лишаються після відкидання хвостового
+    "блоку" з цифр/символів довжиною від 0 до довжини всього хвоста.
+    Так ловиться і короткий суфікс ("password1" -> "password"), і
+    довгий цифровий словниковий хвіст ("qwerty123456" -> "qwerty",
+    бо "123456" теж є словом зі словника).
+    Префікс коротший за min_prefix відкидається як занадто неінформативний.
+    """
+    candidates = [s]
+    i = len(s)
+    while i > 0 and TRAILING_CHARS.match(s[i - 1]):
+        i -= 1
+        prefix = s[:i]
+        if len(prefix) >= min_prefix:
+            candidates.append(prefix)
+    return candidates
+
+
+def _normalize_variants(password: str) -> list[str]:
+    """
+    Повертає список "нормалізованих" варіантів пароля для перевірки
+    проти словника: оригінал у нижньому регістрі, усі варіанти без
+    хвостових цифр/символів різної довжини, та з розкритим leetspeak.
+    Це ловить "password1", "P@ssw0rd!", "qwerty123456" тощо, навіть
+    якщо точної строки нема у словнику.
+    """
+    lower = password.lower()
+
+    stripped_candidates = _trailing_strip_candidates(lower)
+
+    variants: set[str] = set()
+    for candidate in stripped_candidates:
+        variants.add(candidate)
+        variants.add(candidate.translate(LEET_MAP))
+
+    variants.discard("")
+    return list(variants)
 
 
 def analyze_password(password: str, common_set: set[str] | None = None) -> PasswordReport:
@@ -66,18 +129,23 @@ def analyze_password(password: str, common_set: set[str] | None = None) -> Passw
     if has_digit:
         charset_size += 10
     if has_symbol:
-        charset_size += 33  # приблизна кількість друкованих символів-спецсимволів
+        charset_size += 33
 
     length = len(password)
     entropy_bits = length * math.log2(charset_size) if charset_size and length else 0.0
 
-    is_common = password.lower() in common_set
+    matched_base = None
+    for variant in sorted(_normalize_variants(password), key=len, reverse=True):
+        if variant in common_set:
+            matched_base = variant
+            break
+    is_common = matched_base is not None
 
     crack_time_seconds = (2 ** entropy_bits) / GUESSES_PER_SECOND if entropy_bits else 0.0
     if is_common:
-        crack_time_seconds = 0.0  # у словнику — підбирається миттєво
+        crack_time_seconds = 0.0
 
-    score, verdict = _score_password(length, charset_size, entropy_bits, is_common)
+    score, verdict = _score_password(length, entropy_bits, is_common)
 
     return PasswordReport(
         password=password,
@@ -89,15 +157,16 @@ def analyze_password(password: str, common_set: set[str] | None = None) -> Passw
         charset_size=charset_size,
         entropy_bits=entropy_bits,
         is_common=is_common,
+        matched_base=matched_base,
         crack_time_seconds=crack_time_seconds,
         score=score,
         verdict=verdict,
     )
 
 
-def _score_password(length: int, charset_size: int, entropy_bits: float, is_common: bool) -> tuple[int, str]:
+def _score_password(length: int, entropy_bits: float, is_common: bool) -> tuple[int, str]:
     if is_common:
-        return 0, "Дуже слабкий (пароль у відкритих словниках)"
+        return 0, "Дуже слабкий (пароль у словнику витоків, навіть з мутацією)"
     if length < 8:
         return 0, "Дуже слабкий (занадто короткий)"
 
@@ -141,7 +210,10 @@ def print_report(report: PasswordReport) -> None:
     print(f"  Великі літери:   {'так' if report.has_upper else 'ні'}")
     print(f"  Цифри:           {'так' if report.has_digit else 'ні'}")
     print(f"  Символи:         {'так' if report.has_symbol else 'ні'}")
-    print(f"  У списку витоків:{'ТАК — замінити негайно' if report.is_common else ' ні'}")
+    if report.is_common:
+        print(f"  У списку витоків:ТАК (схоже на «{report.matched_base}») — замінити негайно")
+    else:
+        print(f"  У списку витоків: ні")
     print(f"  Ентропія:        {report.entropy_bits:.1f} біт")
     print(f"  Час на злом:     {format_duration(report.crack_time_seconds)}")
     print(f"  Оцінка:          [{bar_filled}{bar_empty}] {report.verdict}")
